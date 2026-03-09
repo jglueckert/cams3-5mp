@@ -1,0 +1,384 @@
+/**
+ * M5Stack CAMS3 5MP — MJPEG Stream for Frigate NVR
+ * ==================================================
+ * Board:   M5Stack CAMS3 5MP (ESP32-S3 + PY260/OV5640 sensor)
+ *
+ * IMPORTANT — READ BEFORE FLASHING:
+ *   The CAMS3 5MP has TWO hardware versions with different pin maps.
+ *   Flash the version detector sketch first (cams3_5mp_version_detect.ino),
+ *   then set HW_VERSION below to match your unit before flashing this sketch.
+ *
+ *   HW_VERSION 1 = New hardware (Serial Monitor shows "New Version (0x01)")
+ *   HW_VERSION 0 = Old hardware (Serial Monitor shows "Old Version (0xFF)")
+ *
+ * OLD HARDWARE EXTRA STEP:
+ *   The standard esp32-camera library does not support the old CAMS3 5MP.
+ *   You must replace the camera library file before compiling:
+ *   1. Install esp32 board package version 3.1.0 (not latest)
+ *   2. Download patched lib from M5Stack:
+ *      https://m5stack-doc.oss-cn-shenzhen.aliyuncs.com/1050/libespressif__esp32-camera.zip
+ *   3. Extract and replace the file at:
+ *      Windows: C:\Users\<user>\AppData\Local\Arduino15\packages\esp32\tools\
+ *               esp32-arduino-libs\idf-release_v5.3-083aad99-v2\esp32s3\lib\
+ *               libespressif__esp32-camera.a
+ *   Full instructions: https://docs.m5stack.com/en/arduino/m5unitcams3_5mp/program
+ *
+ * BOARD SETTINGS (Tools menu):
+ *   Board:            esp32 -> M5UnitCAMS3
+ *   PSRAM:            OPI PSRAM
+ *   Partition Scheme: Huge APP (3MB No OTA/1MB SPIFFS)
+ *   USB CDC On Boot:  Enabled
+ *   Upload Speed:     921600
+ *
+ * REQUIRED LIBRARIES:
+ *   - M5Unified (by M5Stack) via Library Manager
+ *   esp32-camera is bundled with the esp32 board package.
+ *
+ * FRIGATE CONFIG (config.yml):
+ *   cameras:
+ *     cams3:
+ *       ffmpeg:
+ *         inputs:
+ *           - path: http://<CAMERA_IP>:81/stream
+ *             roles:
+ *               - detect
+ *               - record
+ *       detect:
+ *         width: 1280
+ *         height: 720
+ *         fps: 10
+ */
+
+#include "esp_camera.h"
+#include "esp_http_server.h"
+#include <WiFi.h>
+// M5Unified intentionally omitted — the CAMS3 unit has no display or IMU,
+// and M5Unified's board auto-detection loop repeatedly attempts to claim
+// I2C bus 1 which esp_camera already owns, flooding the log with errors.
+
+// -----------------------------------------
+//  USER CONFIGURATION -- edit these values
+// -----------------------------------------
+
+// Set to 1 if version detector printed "New Version (0x01)"
+// Set to 0 if version detector printed "Old Version (0xFF)"
+#define HW_VERSION 1
+
+const char* WIFI_SSID     = "Null";
+const char* WIFI_PASSWORD = "Null";
+
+// Stream resolution. The OV5640 supports high resolutions but
+// for Frigate's detect pipeline HD (1280x720) is the sweet spot.
+// Options:
+//   FRAMESIZE_QVGA   320x240
+//   FRAMESIZE_VGA    640x480
+//   FRAMESIZE_HD     1280x720  <-- recommended default
+//   FRAMESIZE_FHD    1920x1080
+//   FRAMESIZE_UXGA   1600x1200
+framesize_t STREAM_RESOLUTION = FRAMESIZE_HD;
+
+// JPEG quality: 10 (best) to 63 (worst). 12 is a good default.
+int JPEG_QUALITY = 12;
+
+// HTTP port Frigate connects to
+int STREAM_PORT = 81;
+
+// Optional static IP
+bool USE_STATIC_IP   = false;
+IPAddress STATIC_IP  (192, 168, 1, 200);
+IPAddress GATEWAY    (192, 168, 1,   1);
+IPAddress SUBNET     (255, 255, 255, 0);
+IPAddress DNS1       (  8,   8,   8, 8);
+// -----------------------------------------
+
+// ── Pin maps — selected by HW_VERSION above ──
+// New hardware (0x01): confirmed from M5Stack official CameraWebServer example
+// Old hardware (0xFF): confirmed from M5Stack/ESPHome community schematics
+#if HW_VERSION == 1
+  // New hardware version pin map
+  #define PWDN_GPIO_NUM    -1
+  #define RESET_GPIO_NUM   21
+  #define XCLK_GPIO_NUM    11
+  #define SIOD_GPIO_NUM    17
+  #define SIOC_GPIO_NUM    41
+
+  #define Y9_GPIO_NUM      13
+  #define Y8_GPIO_NUM       4
+  #define Y7_GPIO_NUM      10
+  #define Y6_GPIO_NUM       5
+  #define Y5_GPIO_NUM       7
+  #define Y4_GPIO_NUM      16
+  #define Y3_GPIO_NUM      15
+  #define Y2_GPIO_NUM       6
+  #define VSYNC_GPIO_NUM   42
+  #define HREF_GPIO_NUM    18
+  #define PCLK_GPIO_NUM    12
+
+#else
+  // Old hardware version pin map
+  #define PWDN_GPIO_NUM    -1
+  #define RESET_GPIO_NUM   21
+  #define XCLK_GPIO_NUM    11
+  #define SIOD_GPIO_NUM    17
+  #define SIOC_GPIO_NUM    41
+
+  #define Y9_GPIO_NUM      13
+  #define Y8_GPIO_NUM       4
+  #define Y7_GPIO_NUM      10
+  #define Y6_GPIO_NUM       5
+  #define Y5_GPIO_NUM       7
+  #define Y4_GPIO_NUM      16
+  #define Y3_GPIO_NUM      15
+  #define Y2_GPIO_NUM       6
+  #define VSYNC_GPIO_NUM   42
+  #define HREF_GPIO_NUM    18
+  #define PCLK_GPIO_NUM    12
+  // Note: old hardware uses same GPIO layout but needs the patched
+  // libespressif__esp32-camera.a to initialise the sensor correctly.
+#endif
+
+// -- Multipart MJPEG stream constants --
+#define PART_BOUNDARY "ov5640frame"
+static const char* STREAM_CONTENT_TYPE =
+  "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* STREAM_BOUNDARY =
+  "\r\n--" PART_BOUNDARY "\r\n";
+static const char* STREAM_PART =
+  "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+httpd_handle_t stream_httpd = NULL;
+
+// -- Stream handler --
+static esp_err_t stream_handler(httpd_req_t* req) {
+  camera_fb_t* fb  = NULL;
+  esp_err_t    res = ESP_OK;
+  char         part_buf[128];
+
+  res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) return res;
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache");
+
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("[WARN] Frame capture failed -- retrying");
+      delay(100);
+      continue;  // skip this frame, don't kill the stream connection
+    }
+
+    res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
+    if (res != ESP_OK) break;
+
+    size_t hlen = snprintf(part_buf, sizeof(part_buf), STREAM_PART, fb->len);
+    res = httpd_resp_send_chunk(req, part_buf, hlen);
+    if (res != ESP_OK) break;
+
+    res = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+    fb = NULL;
+
+    if (res != ESP_OK) break;
+  }
+
+  if (fb) esp_camera_fb_return(fb);
+  return res;
+}
+
+// -- Snapshot handler --
+static esp_err_t capture_handler(httpd_req_t* req) {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { httpd_resp_send_500(req); return ESP_FAIL; }
+
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=snap.jpg");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  esp_err_t res = httpd_resp_send(req, (const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+  return res;
+}
+
+// -- HTTP server --
+void startServer() {
+  if (stream_httpd) { httpd_stop(stream_httpd); stream_httpd = NULL; delay(100); }
+
+  httpd_config_t config   = HTTPD_DEFAULT_CONFIG();
+  config.server_port      = STREAM_PORT;
+  config.max_uri_handlers = 4;
+  config.lru_purge_enable = true;
+
+  httpd_uri_t stream_uri  = { "/stream",  HTTP_GET, stream_handler,  NULL };
+  httpd_uri_t capture_uri = { "/capture", HTTP_GET, capture_handler, NULL };
+
+  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &stream_uri);
+    httpd_register_uri_handler(stream_httpd, &capture_uri);
+    Serial.printf("[OK] Stream:   http://%s:%d/stream\n",
+                  WiFi.localIP().toString().c_str(), STREAM_PORT);
+    Serial.printf("[OK] Snapshot: http://%s:%d/capture\n",
+                  WiFi.localIP().toString().c_str(), STREAM_PORT);
+  } else {
+    Serial.println("[ERR] HTTP server failed to start");
+  }
+}
+
+// -- Camera init --
+bool initCamera() {
+  Serial.printf("[..] Initialising camera (HW_VERSION %d)...\n", HW_VERSION);
+
+  camera_config_t config;
+  config.ledc_channel  = LEDC_CHANNEL_0;
+  config.ledc_timer    = LEDC_TIMER_0;
+  config.pin_d0        = Y2_GPIO_NUM;
+  config.pin_d1        = Y3_GPIO_NUM;
+  config.pin_d2        = Y4_GPIO_NUM;
+  config.pin_d3        = Y5_GPIO_NUM;
+  config.pin_d4        = Y6_GPIO_NUM;
+  config.pin_d5        = Y7_GPIO_NUM;
+  config.pin_d6        = Y8_GPIO_NUM;
+  config.pin_d7        = Y9_GPIO_NUM;
+  config.pin_xclk      = XCLK_GPIO_NUM;
+  config.pin_pclk      = PCLK_GPIO_NUM;
+  config.pin_vsync     = VSYNC_GPIO_NUM;
+  config.pin_href      = HREF_GPIO_NUM;
+  config.pin_sscb_sda  = SIOD_GPIO_NUM;
+  config.pin_sscb_scl  = SIOC_GPIO_NUM;
+  config.pin_pwdn      = PWDN_GPIO_NUM;
+  config.pin_reset     = RESET_GPIO_NUM;
+  config.xclk_freq_hz  = 20000000;
+  config.pixel_format  = PIXFORMAT_JPEG;
+  config.frame_size    = STREAM_RESOLUTION;
+  config.jpeg_quality  = JPEG_QUALITY;
+  config.fb_count      = 2;
+  config.fb_location   = CAMERA_FB_IN_PSRAM;
+  config.grab_mode     = CAMERA_GRAB_LATEST;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("[ERR] esp_camera_init failed: 0x%x\n", err);
+    if (err == 0x106 && HW_VERSION == 0) {
+      Serial.println("      Old hardware detected but standard library failed.");
+      Serial.println("      You need the patched esp32-camera library.");
+      Serial.println("      See: docs.m5stack.com/en/arduino/m5unitcams3_5mp/program");
+    }
+    return false;
+  }
+
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) { Serial.println("[ERR] Sensor get failed"); return false; }
+
+  Serial.printf("[OK] Sensor PID: 0x%04X  VER: 0x%02X\n", s->id.PID, s->id.VER);
+
+  // OV5640 tuning
+  s->set_quality(s, JPEG_QUALITY);
+  s->set_framesize(s, STREAM_RESOLUTION);
+  s->set_brightness(s, 0);
+  s->set_contrast(s, 0);
+  s->set_saturation(s, 0);
+  s->set_sharpness(s, 0);
+  s->set_denoise(s, 1);
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, 0);
+  s->set_exposure_ctrl(s, 1);
+  s->set_aec2(s, 1);
+  s->set_ae_level(s, 0);
+  s->set_gain_ctrl(s, 1);
+  s->set_agc_gain(s, 0);
+  s->set_gainceiling(s, (gainceiling_t)6);
+  s->set_bpc(s, 1);
+  s->set_wpc(s, 1);
+  s->set_raw_gma(s, 1);
+  s->set_lenc(s, 1);
+  s->set_hmirror(s, 0);  // set to 1 if image is mirrored
+  s->set_vflip(s, 0);    // set to 1 if image is upside-down
+  s->set_dcw(s, 1);
+  s->set_colorbar(s, 0);
+
+  Serial.printf("[OK] Camera ready -- %s @ quality %d\n",
+                framesize_name(STREAM_RESOLUTION), JPEG_QUALITY);
+
+  // OV5640 needs time to stabilise AEC/AGC after register init.
+  // Without this delay the first several fb_get() calls return null.
+  Serial.println("[..] Sensor warm-up (800ms)...");
+  delay(800);
+
+  // Drain any stale frames that accumulated during warm-up so Frigate
+  // always receives a fresh frame on first connect.
+  Serial.println("[..] Flushing frame buffer...");
+  for (int i = 0; i < 4; i++) {
+    camera_fb_t* warmup_fb = esp_camera_fb_get();
+    if (warmup_fb) {
+      esp_camera_fb_return(warmup_fb);
+      Serial.printf("    flushed frame %d (%u bytes)\n", i + 1, warmup_fb->len);
+    } else {
+      Serial.printf("    frame %d was null -- sensor may need more time\n", i + 1);
+      delay(200);
+    }
+  }
+
+  return true;
+}
+
+const char* framesize_name(framesize_t fs) {
+  switch (fs) {
+    case FRAMESIZE_QVGA:  return "320x240 QVGA";
+    case FRAMESIZE_VGA:   return "640x480 VGA";
+    case FRAMESIZE_HD:    return "1280x720 HD";
+    case FRAMESIZE_FHD:   return "1920x1080 FHD";
+    case FRAMESIZE_UXGA:  return "1600x1200 UXGA";
+    default:              return "custom";
+  }
+}
+
+// -- WiFi --
+void connectWiFi() {
+  if (USE_STATIC_IP) WiFi.config(STATIC_IP, GATEWAY, SUBNET, DNS1);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setSleep(false);
+
+  Serial.print("[..] Connecting to WiFi");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[OK] WiFi connected -- IP: %s  RSSI: %d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  } else {
+    Serial.println("\n[ERR] WiFi failed -- restarting");
+    delay(3000);
+    ESP.restart();
+  }
+}
+
+// -----------------------------------------
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== M5Stack CAMS3 5MP -> Frigate Stream ===");
+  Serial.printf("    HW_VERSION: %d  |  Sensor: PY260/OV5640\n", HW_VERSION);
+
+  // Camera must init before anything else to claim I2C bus 1 first.
+  if (!initCamera()) {
+    Serial.println("[ERR] Camera init failed -- halting");
+    while (true) delay(500);
+  }
+
+  connectWiFi();
+  startServer();
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WARN] WiFi lost -- reconnecting...");
+    connectWiFi();
+    startServer();
+  }
+
+  delay(5000);
+}
